@@ -17,11 +17,11 @@ import (
 	"unsafe"
 
 	ole "github.com/go-ole/go-ole"
-	winipcfg "github.com/tailscale/winipcfg-go"
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/wgengine/winnet"
 )
 
@@ -36,22 +36,22 @@ func htonl(val uint32) uint32 {
 	return *(*uint32)(unsafe.Pointer(&bytes[0]))
 }
 
-func bindSocketRoute(family winipcfg.AddressFamily, device *device.Device, ourLuid uint64, lastLuid *uint64) error {
-	routes, err := winipcfg.GetRoutes(family)
+func bindSocketRoute(family winipcfg.AddressFamily, device *device.Device, ourLuid winipcfg.LUID, lastLuid *winipcfg.LUID) error {
+	routes, err := winipcfg.GetIPForwardTable2(family)
 	if err != nil {
 		return err
 	}
 	lowestMetric := ^uint32(0)
-	index := uint32(0) // Zero is "unspecified", which for IP_UNICAST_IF resets the value, which is what we want.
-	luid := uint64(0)  // Hopefully luid zero is unspecified, but hard to find docs saying so.
+	index := uint32(0)       // Zero is "unspecified", which for IP_UNICAST_IF resets the value, which is what we want.
+	luid := winipcfg.LUID(0) // Hopefully luid zero is unspecified, but hard to find docs saying so.
 	for _, route := range routes {
-		if route.DestinationPrefix.PrefixLength != 0 || route.InterfaceLuid == ourLuid {
+		if route.DestinationPrefix.PrefixLength != 0 || route.InterfaceLUID == ourLuid {
 			continue
 		}
 		if route.Metric < lowestMetric {
 			lowestMetric = route.Metric
 			index = route.InterfaceIndex
-			luid = route.InterfaceLuid
+			luid = route.InterfaceLUID
 		}
 	}
 	if luid == *lastLuid {
@@ -64,9 +64,9 @@ func bindSocketRoute(family winipcfg.AddressFamily, device *device.Device, ourLu
 			return fmt.Errorf("unexpected device.Bind type %T", device.Bind())
 		}
 		// TODO(apenwarr): doesn't work with magic socket yet.
-		if family == winipcfg.AF_INET {
+		if family == windows.AF_INET {
 			return bind.BindSocketToInterface4(index, false)
-		} else if family == winipcfg.AF_INET6 {
+		} else if family == windows.AF_INET6 {
 			return bind.BindSocketToInterface6(index, false)
 		}
 	} else {
@@ -77,19 +77,19 @@ func bindSocketRoute(family winipcfg.AddressFamily, device *device.Device, ourLu
 
 func monitorDefaultRoutes(device *device.Device, autoMTU bool, tun *tun.NativeTun) (*winipcfg.RouteChangeCallback, error) {
 	guid := tun.GUID()
-	ourLuid, err := winipcfg.InterfaceGuidToLuid(&guid)
-	lastLuid4 := uint64(0)
-	lastLuid6 := uint64(0)
+	ourLuid, err := winipcfg.LUIDFromGUID(&guid)
+	lastLuid4 := winipcfg.LUID(0)
+	lastLuid6 := winipcfg.LUID(0)
 	lastMtu := uint32(0)
 	if err != nil {
 		return nil, err
 	}
 	doIt := func() error {
-		err = bindSocketRoute(winipcfg.AF_INET, device, ourLuid, &lastLuid4)
+		err = bindSocketRoute(windows.AF_INET, device, ourLuid, &lastLuid4)
 		if err != nil {
 			return err
 		}
-		err = bindSocketRoute(winipcfg.AF_INET6, device, ourLuid, &lastLuid6)
+		err = bindSocketRoute(windows.AF_INET6, device, ourLuid, &lastLuid6)
 		if err != nil {
 			log.Printf("bindSocketRoute(AF_INET6): %v", err)
 			return err
@@ -99,53 +99,53 @@ func monitorDefaultRoutes(device *device.Device, autoMTU bool, tun *tun.NativeTu
 		}
 		mtu := uint32(0)
 		if lastLuid4 != 0 {
-			iface, err := winipcfg.InterfaceFromLUID(lastLuid4)
+			iface, err := lastLuid4.Interface()
 			if err != nil {
 				return err
 			}
-			if iface.Mtu > 0 {
-				mtu = iface.Mtu
+			if iface.MTU > 0 {
+				mtu = iface.MTU
 			}
 		}
 		if lastLuid6 != 0 {
-			iface, err := winipcfg.InterfaceFromLUID(lastLuid6)
+			iface, err := lastLuid6.Interface()
 			if err != nil {
 				return err
 			}
-			if iface.Mtu > 0 && iface.Mtu < mtu {
-				mtu = iface.Mtu
+			if iface.MTU > 0 && iface.MTU < mtu {
+				mtu = iface.MTU
 			}
 		}
 		if mtu > 0 && (lastMtu == 0 || lastMtu != mtu) {
-			iface, err := winipcfg.GetIpInterface(ourLuid, winipcfg.AF_INET)
+			iface, err := ourLuid.IPInterface(windows.AF_INET)
 			if err != nil {
 				return err
 			}
-			iface.NlMtu = mtu - 80
+			iface.NLMTU = mtu - 80
 			// If the TUN device was created with a smaller MTU,
 			// though, such as 1280, we don't want to go bigger than
 			// configured. (See the comment on minimalMTU in the
 			// wgengine package.)
-			if min, err := tun.MTU(); err == nil && min < int(iface.NlMtu) {
-				iface.NlMtu = uint32(min)
+			if min, err := tun.MTU(); err == nil && min < int(iface.NLMTU) {
+				iface.NLMTU = uint32(min)
 			}
-			if iface.NlMtu < 576 {
-				iface.NlMtu = 576
+			if iface.NLMTU < 576 {
+				iface.NLMTU = 576
 			}
 			err = iface.Set()
 			if err != nil {
 				return err
 			}
-			tun.ForceMTU(int(iface.NlMtu)) //TODO: it sort of breaks the model with v6 mtu and v4 mtu being different. Just set v4 one for now.
-			iface, err = winipcfg.GetIpInterface(ourLuid, winipcfg.AF_INET6)
+			tun.ForceMTU(int(iface.NLMTU)) //TODO: it sort of breaks the model with v6 mtu and v4 mtu being different. Just set v4 one for now.
+			iface, err = ourLuid.IPInterface(windows.AF_INET6)
 			if err != nil {
 				if !isMissingIPv6Err(err) {
 					return err
 				}
 			} else {
-				iface.NlMtu = mtu - 80
-				if iface.NlMtu < 1280 {
-					iface.NlMtu = 1280
+				iface.NLMTU = mtu - 80
+				if iface.NLMTU < 1280 {
+					iface.NLMTU = 1280
 				}
 				err = iface.Set()
 				if err != nil {
@@ -160,7 +160,7 @@ func monitorDefaultRoutes(device *device.Device, autoMTU bool, tun *tun.NativeTu
 	if err != nil {
 		return nil, err
 	}
-	cb, err := winipcfg.RegisterRouteChangeCallback(func(notificationType winipcfg.MibNotificationType, route *winipcfg.Route) {
+	cb, err := winipcfg.RegisterRouteChangeCallback(func(notificationType winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
 		//fmt.Printf("MonitorDefaultRoutes: changed: %v\n", route.DestinationPrefix)
 		if route.DestinationPrefix.PrefixLength == 0 {
 			_ = doIt()
@@ -233,7 +233,7 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) error {
 	const mtu = 0
 	guid := tun.GUID()
 	log.Printf("wintun GUID is %v", guid)
-	iface, err := winipcfg.InterfaceFromGUID(&guid)
+	iface, err := interfaceFromGUID(&guid)
 	if err != nil {
 		return err
 	}
@@ -314,7 +314,7 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) error {
 		routes = append(routes, r)
 	}
 
-	err = iface.SyncAddresses(addresses)
+	err = syncAddresses(iface, addresses)
 	if err != nil {
 		return err
 	}
@@ -335,13 +335,13 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) error {
 	log.Printf("routes: %v", routes)
 
 	var errAcc error
-	err = iface.SyncRoutes(deduplicatedRoutes)
+	err = syncRoutes(iface, deduplicatedRoutes)
 	if err != nil && errAcc == nil {
 		log.Printf("setroutes: %v", err)
 		errAcc = err
 	}
 
-	ipif, err := iface.GetIpInterface(winipcfg.AF_INET)
+	ipif, err := iface.LUID.IPInterface(windows.AF_INET)
 	if err != nil {
 		log.Printf("getipif: %v", err)
 		return err
@@ -352,15 +352,15 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) error {
 		ipif.Metric = 0
 	}
 	if mtu > 0 {
-		ipif.NlMtu = uint32(mtu)
-		tun.ForceMTU(int(ipif.NlMtu))
+		ipif.NLMTU = uint32(mtu)
+		tun.ForceMTU(int(ipif.NLMTU))
 	}
 	err = ipif.Set()
 	if err != nil && errAcc == nil {
 		errAcc = err
 	}
 
-	ipif, err = iface.GetIpInterface(winipcfg.AF_INET6)
+	ipif, err = iface.LUID.IPInterface(windows.AF_INET6)
 	if err != nil {
 		if !isMissingIPv6Err(err) {
 			return err
@@ -371,7 +371,7 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) error {
 			ipif.Metric = 0
 		}
 		if mtu > 0 {
-			ipif.NlMtu = uint32(mtu)
+			ipif.NLMTU = uint32(mtu)
 		}
 		ipif.DadTransmits = 0
 		ipif.RouterDiscoveryBehavior = winipcfg.RouterDiscoveryDisabled
