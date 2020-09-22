@@ -5,7 +5,11 @@
 package router
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -79,12 +83,16 @@ type netfilterRunner interface {
 
 type linuxRouter struct {
 	logf             func(fmt string, args ...interface{})
-	ipRuleAvailable  bool
 	tunname          string
 	addrs            map[netaddr.IPPrefix]bool
 	routes           map[netaddr.IPPrefix]bool
 	snatSubnetRoutes bool
 	netfilterMode    NetfilterMode
+
+	// Various feature checks for the network stack.
+	ipRuleAvailable bool
+	v6Available     bool
+	v6NATAvailable  bool
 
 	dns *dns.Manager
 
@@ -120,15 +128,21 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netfilter4, ne
 		InterfaceName: tunname,
 	}
 
+	supportsV6 := supportsV6()
+
 	return &linuxRouter{
-		logf:            logf,
+		logf:          logf,
+		tunname:       tunname,
+		netfilterMode: NetfilterOff,
+
 		ipRuleAvailable: ipRuleAvailable,
-		tunname:         tunname,
-		netfilterMode:   NetfilterOff,
-		ipt4:            netfilter4,
-		ipt6:            netfilter6,
-		cmd:             cmd,
-		dns:             dns.NewManager(mconfig),
+		v6Available:     supportsV6,
+		v6NATAvailable:  supportsV6 && supportsV6NAT(),
+
+		ipt4: netfilter4,
+		ipt6: netfilter6,
+		cmd:  cmd,
+		dns:  dns.NewManager(mconfig),
 	}, nil
 }
 
@@ -423,6 +437,13 @@ func (r *linuxRouter) downInterface() error {
 	return r.cmd.run("ip", "link", "set", "dev", r.tunname, "down")
 }
 
+func (r *linuxRouter) iprouteFamilies() []string {
+	if r.v6Available {
+		return []string{"-4", "-6"}
+	}
+	return []string{"-4"}
+}
+
 // addIPRules adds the policy routing rule that avoids tailscaled
 // routing loops. If the rule exists and appears to be a
 // tailscale-managed rule, it is gracefully replaced.
@@ -439,7 +460,7 @@ func (r *linuxRouter) addIPRules() error {
 
 	rg := newRunGroup(nil, r.cmd)
 
-	for _, family := range []string{"-4", "-6"} {
+	for _, family := range r.iprouteFamilies() {
 		// NOTE(apenwarr): We leave spaces between each pref number.
 		// This is so the sysadmin can override by inserting rules in
 		// between if they want.
@@ -512,7 +533,7 @@ func (r *linuxRouter) delIPRules() error {
 	// unknown rules during deletion.
 	rg := newRunGroup([]int{2, 254}, r.cmd)
 
-	for _, family := range []string{"-4", "-6"} {
+	for _, family := range r.iprouteFamilies() {
 		// When deleting rules, we want to be a bit specific (mention which
 		// table we were routing to) but not *too* specific (fwmarks, etc).
 		// That leaves us some flexibility to change these values in later
@@ -554,6 +575,13 @@ func (r *linuxRouter) delIPRules() error {
 	return rg.ErrAcc
 }
 
+func (r *linuxRouter) netfilterFamilies() []netfilterRunner {
+	if r.v6Available {
+		return []netfilterRunner{r.ipt4, r.ipt6}
+	}
+	return []netfilterRunner{r.ipt4}
+}
+
 // addNetfilterChains creates custom Tailscale chains in netfilter.
 func (r *linuxRouter) addNetfilterChains() error {
 	create := func(ipt netfilterRunner, table, chain string) error {
@@ -568,14 +596,19 @@ func (r *linuxRouter) addNetfilterChains() error {
 		return nil
 	}
 
-	for _, ipt := range []netfilterRunner{r.ipt4, r.ipt6} {
+	for _, ipt := range r.netfilterFamilies() {
 		if err := create(ipt, "filter", "ts-input"); err != nil {
 			return err
 		}
 		if err := create(ipt, "filter", "ts-forward"); err != nil {
 			return err
 		}
-		if err := create(ipt, "nat", "ts-postrouting"); err != nil {
+	}
+	if err := create(r.ipt4, "nat", "ts-postrouting"); err != nil {
+		return err
+	}
+	if r.v6NATAvailable {
+		if err := create(r.ipt6, "nat", "ts-postrouting"); err != nil {
 			return err
 		}
 	}
@@ -686,14 +719,19 @@ func (r *linuxRouter) delNetfilterChains() error {
 		return nil
 	}
 
-	for _, ipt := range []netfilterRunner{r.ipt4, r.ipt6} {
+	for _, ipt := range r.netfilterFamilies() {
 		if err := del(ipt, "filter", "ts-input"); err != nil {
 			return err
 		}
 		if err := del(ipt, "filter", "ts-forward"); err != nil {
 			return err
 		}
-		if err := del(ipt, "nat", "ts-postrouting"); err != nil {
+	}
+	if err := del(r.ipt4, "nat", "ts-postrouting"); err != nil {
+		return err
+	}
+	if r.v6NATAvailable {
+		if err := del(r.ipt6, "nat", "ts-postrouting"); err != nil {
 			return err
 		}
 	}
@@ -716,14 +754,19 @@ func (r *linuxRouter) delNetfilterBase() error {
 		return nil
 	}
 
-	for _, ipt := range []netfilterRunner{r.ipt4, r.ipt6} {
+	for _, ipt := range r.netfilterFamilies() {
 		if err := del(ipt, "filter", "ts-input"); err != nil {
 			return err
 		}
 		if err := del(ipt, "filter", "ts-forward"); err != nil {
 			return err
 		}
-		if err := del(ipt, "nat", "ts-postrouting"); err != nil {
+	}
+	if err := del(r.ipt4, "nat", "ts-postrouting"); err != nil {
+		return err
+	}
+	if r.v6NATAvailable {
+		if err := del(r.ipt6, "nat", "ts-postrouting"); err != nil {
 			return err
 		}
 	}
@@ -752,14 +795,19 @@ func (r *linuxRouter) addNetfilterHooks() error {
 		return nil
 	}
 
-	for _, ipt := range []netfilterRunner{r.ipt4, r.ipt6} {
+	for _, ipt := range r.netfilterFamilies() {
 		if err := divert(ipt, "filter", "INPUT"); err != nil {
 			return err
 		}
 		if err := divert(ipt, "filter", "FORWARD"); err != nil {
 			return err
 		}
-		if err := divert(ipt, "nat", "POSTROUTING"); err != nil {
+	}
+	if err := divert(r.ipt4, "nat", "POSTROUTING"); err != nil {
+		return err
+	}
+	if r.v6NATAvailable {
+		if err := divert(r.ipt6, "nat", "POSTROUTING"); err != nil {
 			return err
 		}
 	}
@@ -784,14 +832,19 @@ func (r *linuxRouter) delNetfilterHooks() error {
 		return nil
 	}
 
-	for _, ipt := range []netfilterRunner{r.ipt4, r.ipt6} {
+	for _, ipt := range r.netfilterFamilies() {
 		if err := del(ipt, "filter", "INPUT"); err != nil {
 			return err
 		}
 		if err := del(ipt, "filter", "FORWARD"); err != nil {
 			return err
 		}
-		if err := del(ipt, "nat", "POSTROUTING"); err != nil {
+	}
+	if err := del(r.ipt4, "nat", "POSTROUTING"); err != nil {
+		return err
+	}
+	if r.v6NATAvailable {
+		if err := del(r.ipt6, "nat", "POSTROUTING"); err != nil {
 			return err
 		}
 	}
@@ -809,8 +862,10 @@ func (r *linuxRouter) addSNATRule() error {
 	if err := r.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
 	}
-	if err := r.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
-		return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
+	if r.v6NATAvailable {
+		if err := r.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
+			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
+		}
 	}
 	return nil
 }
@@ -826,8 +881,10 @@ func (r *linuxRouter) delSNATRule() error {
 	if err := r.ipt4.Delete("nat", "ts-postrouting", args...); err != nil {
 		return fmt.Errorf("deleting %v in v4/nat/ts-postrouting: %w", args, err)
 	}
-	if err := r.ipt6.Delete("nat", "ts-postrouting", args...); err != nil {
-		return fmt.Errorf("deleting %v in v6/nat/ts-postrouting: %w", args, err)
+	if r.v6NATAvailable {
+		if err := r.ipt6.Delete("nat", "ts-postrouting", args...); err != nil {
+			return fmt.Errorf("deleting %v in v6/nat/ts-postrouting: %w", args, err)
+		}
 	}
 	return nil
 }
@@ -914,4 +971,39 @@ func normalizeCIDR(cidr netaddr.IPPrefix) string {
 
 func cleanup(logf logger.Logf, interfaceName string) {
 	// TODO(dmytro): clean up iptables.
+}
+
+// supportsV6 returns whether the system appears to have a working
+// IPv6 network stack.
+func supportsV6() bool {
+	_, err := os.Stat("/proc/sys/net/ipv6")
+	if os.IsNotExist(err) {
+		return false
+	}
+	bs, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+	if err != nil {
+		// Be conservative if we can't find the ipv6 configuration knob.
+		return false
+	}
+	disabled, err := strconv.ParseBool(strings.TrimSpace(string(bs)))
+	if err != nil {
+		return false
+	}
+	return !disabled
+}
+
+// supportsV6NAT returns whether the system has a "nat" table in the
+// IPv6 netfilter stack.
+//
+// The nat table was added after the initial release of ipv6
+// netfilter, so some older distros ship a kernel that can't NAT IPv6
+// traffic.
+func supportsV6NAT() bool {
+	bs, err := ioutil.ReadFile("/proc/net/ip6_tables_names")
+	if err != nil {
+		// Can't read the file. Assume SNAT works.
+		return true
+	}
+
+	return bytes.Contains(bs, []byte("nat\n"))
 }
